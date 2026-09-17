@@ -1,0 +1,34 @@
+[project]
+name = "ppo-gym"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gymnasium>=1.3.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.2",
+    "stable-baselines3>=2.9.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+]
+
+[project.scripts]
+ppo-gym = "ppo_gym.main:main"
+
+# 明确声明只从 pytorch-cu126 源拉取 torch 和 torchvision
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+# 将该源设为显式源（普通包不会碰它，只有上面的 sources 会用它）
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
+

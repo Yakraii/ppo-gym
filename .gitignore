@@ -1,0 +1,18 @@
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Notebook 检查点不进入 Git
+.ipynb_checkpoints/
+
+# 编辑器配置
+.idea/
+.vscode/
+
+# 训练输出：只保留目录占位文件
+outputs/*
+!outputs/.gitkeep
+*.pt
+*.pth
