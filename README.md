@@ -1,78 +1,74 @@
 # PPO Gym
 
-使用 PyTorch 自己实现的最小 PPO 模板，目标是复用同一套代码完成：
+用 PyTorch 实现的 PPO，同一套算法代码复用于：
 
 - `CartPole-v1`
 - `LunarLander-v3`
 
-算法代码位于 `src/ppo_gym/`，训练入口为 `src/ppo_gym/main.py`。正式交付不使用 Stable-Baselines3 代替自研 PPO。
+核心设计：网络维度从环境自动读取（`env.observation_space` / `env.action_space`），算法与具体环境解耦。
 
 ## 目录结构
 
 ```text
-ppo-gym/
-├── pyproject.toml
-├── README.md
-├── Task.md
-├── Plan.md
-├── .gitignore
-├── tests/
-│   └── test_ppo.py
-├── outputs/                    # 训练产生，不提交 Git
-└── src/
-    └── ppo_gym/
-        ├── __init__.py
-        ├── main.py             # 命令行、环境创建、训练/评估调度
-        ├── model.py            # Actor-Critic 网络
-        ├── ppo.py              # Rollout、GAE、PPO 更新、保存加载
-        └── utils.py            # seed、JSON、绘图等工具
+src/ppo_gym/
+├── config.py      # PPOConfig,超参数集中管理
+├── networks.py    # Actor / Critic 独立 MLP(正交初始化)
+├── buffer.py      # RolloutBuffer + GAE(严格区分 terminated / truncated)
+├── ppo.py         # PPO 核心:采样、GAE、更新、训练、保存加载
+├── train.py       # 训练入口(命令行 ppo-gym)
+├── evaluate.py    # 训练中周期评估
+├── test.py        # 训练后最终测试
+├── visualize.py   # 弹窗观看 / 录制视频
+└── utils.py       # seed、checkpoint、metrics、绘图
+
+experiments/       # 实验脚本
+checkpoints/       # best.pth / latest.pth
+results/           # metrics CSV、训练/评估曲线、config.json、测试报告
+videos/            # 测试录制的视频
 ```
 
 ## 快速开始
 
 ```powershell
-# 按 pyproject.toml 安装依赖
 uv sync
 
 # 训练 CartPole
-uv run ppo-gym train --env CartPole-v1 --total-steps 100000
+uv run ppo-gym --env CartPole-v1 --total-steps 100000
 
-# 评估模型
-uv run ppo-gym eval --env CartPole-v1 --model outputs/CartPole-v1/latest.pt
+# 训练 + 测试 LunarLander(约 100 万步)
+uv run python experiments/lunarlander/run_lunarlander.py
+#   --skip-train  跳过训练,只测试已有 best.pth
 
-# 运行最简测试
-uv run python -m unittest discover -s tests -v
+# 测试已训练模型
+uv run python -m ppo_gym.test --checkpoint checkpoints/cartpole/best.pth --env CartPole-v1
+
+# 可视化(弹窗观看 / --save-video 录制)
+uv run python -m ppo_gym.visualize --checkpoint checkpoints/cartpole/best.pth --env CartPole-v1
+
 ```
 
-训练结果默认写入 `outputs/<env_id>/`：
+## 超参数
 
-```text
-latest.pt
-config.json
-metrics.json
-training_curve.png       # 需要 matplotlib 时才会生成
-evaluation.json          # 运行 eval 后生成
-```
-
-## LunarLander 依赖提示
-
-`LunarLander-v3` 依赖 Box2D。如果 `gymnasium.make("LunarLander-v3")` 报错，请安装：
+集中在 `PPOConfig`(默认值即 Plan §18 基础配置:lr 3e-4、γ 0.99、λ 0.95、clip 0.2、rollout 2048、epochs 10、batch 64),可通过命令行覆盖,例如:
 
 ```powershell
-uv add "gymnasium[box2d]"
+uv run ppo-gym --env CartPole-v1 --lr 1e-3 --clip-epsilon 0.1
 ```
 
-## 代码职责
+## 结果
 
-- `main.py`：只负责连接环境、Agent 和输出目录，不定义网络和 PPO Loss。
-- `model.py`：只负责 Actor-Critic 网络。
-- `ppo.py`：只负责采样缓存、GAE、PPO 更新和模型保存加载。
-- `utils.py`：只负责跨模块通用工具。
-- `tests/test_ppo.py`：先覆盖最容易出错的网络维度和 GAE。
+每次运行的完整配置写入 `results/<env>/config.json`:
 
-## 当前模板的扩展位置
+```text
+results/<env>/
+├── metrics.csv          # 每回合 return / length
+├── update_metrics.csv   # 每次 update 的 loss / KL / clip_fraction
+├── eval_metrics.csv     # 周期评估结果
+├── curves.png           # 训练曲线(原始 + 移动平均)
+├── eval_curve.png       # 评估曲线(±1 std)
+└── test_report.json     # 最终测试报告(test.py 生成)
+```
 
-- 超参数实验：修改 `PPOConfig` 或使用 `main.py` 的命令行参数。
-- 连续动作环境：在 `model.py` 中增加高斯策略。
-- 并行环境：在以后确实需要时再增加 `envs.py` 和向量化环境。
-- 训练曲线：运行 `uv add matplotlib` 后重新训练，模板会自动生成图片。
+## 参考
+
+算法实现参考 [CleanRL](https://github.com/vwxyzjn/cleanrl) 的 `ppo.py`(正交初始化、Adam eps=1e-5、k3 估计 approx_kl、mini-batch advantage 标准化),实验方案见 `Plan.md`,课题要求见 `Task.md`。
