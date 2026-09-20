@@ -1,0 +1,8 @@
+{
+  "checkpoint": "checkpoints\\lunarlander\\best.pth",
+  "mean_reward": -608.1624360238179,
+  "std_reward": 61.14324243869828,
+  "min_reward": -715.8914108960673,
+  "max_reward": -473.38028471046584,
+  "episodes": 20
+}

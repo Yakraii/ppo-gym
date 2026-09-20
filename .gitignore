@@ -14,5 +14,23 @@ __pycache__/
 # 训练输出：只保留目录占位文件
 outputs/*
 !outputs/.gitkeep
+# 录制的演示视频不进入 Git
+videos/*
+!videos/**/.gitkeep
 *.pt
 *.pth
+
+# 部分md
+answer.md
+Plan.md
+
+# 参考代码
+cleanrl_ppo.py
+
+# 测试代码
+test.py
+test.ipynb
+
+
+
+

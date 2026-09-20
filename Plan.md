@@ -1,221 +1,2089 @@
-# PPO 经典控制任务实施计划
+# PPO Gym 实验 Plan
 
-> 依据：`Task.md`  
-> 项目现状核对日期：2026-09-16
+## 1. 实验目标
 
-## 1. 任务理解
+使用**同一套 PPO 算法代码**完成两个 Gymnasium 经典环境：
 
-- 本课题的目标不是提出新的强化学习算法，而是独立完成一次完整的强化学习开发闭环：环境交互、数据采样、PPO 训练、模型保存与加载、评估、可视化和超参数实验。
-- 必须使用 PyTorch 自己实现 PPO。Stable-Baselines3 不作为最终训练实现，后续最多只用于结果对照，不能成为主流程依赖。
-- 使用 Gymnasium 的 `CartPole-v1` 和 `LunarLander-v3` 两个经典控制环境，二者都属于离散动作空间。
-- 核心工程要求是“同一套 PPO 代码复用于两个环境”，切换环境时只允许改变配置、网络规模、环境参数和训练预算，不应复制算法代码或为某个环境单独重写 PPO。
-- `CartPole-v1` 是第一道正确性门槛：环境简单、反馈快，优先用它验证采样、GAE、PPO Loss、更新和保存加载是否可靠。
-- `LunarLander-v3` 是泛化与稳定性验证：状态、奖励和训练动态更复杂，需要更长训练时间，并检验同一算法实现能否通过配置迁移到新环境。
+1.  `CartPole-v1`
+2.  `LunarLander-v3`
 
-## 2. 当前项目状态
+核心要求：
 
-- 当前仓库只有最小 Python 包骨架，`src/ppo_gym/__init__.py` 还是占位入口。
-- `pyproject.toml` 已声明 Gymnasium、PyTorch 和 Jupyter 等依赖，且配置了 CUDA 126 的 PyTorch 源。
-- 现有虚拟环境为 Python 3.12.10，PyTorch 2.14.0+cu126 可用，`torch.cuda.is_available()` 为 `True`，Gymnasium 版本为 1.3.0。
-- 当前目录尚未初始化为 Git 仓库。
-- `.ipynb_checkpoints/train-checkpoint.ipynb` 中使用 Stable-Baselines3 训练 CartPole，仅能作为环境连通性示例；它不满足“自行实现 PPO”的核心要求，不能作为最终交付代码。
-- 因而主要工作不是修补现有算法，而是从零建立可复用、可测试、可配置的 PyTorch PPO 工程。
+-   PPO 算法与具体环境解耦。
+-   不为两个环境分别实现 PPO。
+-   PPO 自动从 `env` 获取状态维度和动作维度。
+-   Actor 与 Critic 使用**独立网络**。
+-   完成训练、评估、模型保存、训练曲线、超参数实验、模型测试和可视化。
+-   保持**普通实验级别**，不引入过度工程化的设计。
 
-## 3. 总体设计原则
+------------------------------------------------------------------------
 
-- **算法与环境解耦**：PPO 只能依赖观测维度、动作维度、离散动作接口和设备配置，不依赖具体环境名称。
-- **配置驱动**：环境名、训练步数、网络大小、学习率、GAE 参数、批量大小、随机种子和输出目录均通过配置传入。
-- **先正确、后性能**：先完成小规模可运行和单元测试，再追求 CartPole/LunarLander 的收敛成绩。
-- **可复现**：固定 Python、PyTorch、Gymnasium 和依赖版本；记录 seed、完整配置、代码版本和评估方式。
-- **训练与评估分离**：训练时允许随机采样，评估时使用确定性动作，不更新模型，并使用独立评估回合报告指标。
-- **保留证据**：每组实验保存配置、日志、模型、评估结果和曲线，避免只在 notebook 中保留无法复现的输出。
+# 2. 总体设计思想
 
-## 4. 最终采用的简化项目结构
+整个实验采用：
 
-```text
-ppo-gym/
-├── pyproject.toml
-├── README.md
-├── Task.md
-├── Plan.md
-├── .gitignore
-├── tests/
-│   └── test_ppo.py
-├── outputs/                    # 训练产物；不提交大型文件
-└── src/
-    └── ppo_gym/
-        ├── __init__.py
-        ├── main.py             # 命令行、环境创建、训练/评估调度
-        ├── model.py            # Actor-Critic 网络
-        ├── ppo.py              # Rollout、GAE、PPO 更新、保存加载
-        └── utils.py            # seed、设备、日志和绘图工具
+``` text
+                 Gymnasium Environment
+                         │
+                         │ env
+                         ↓
+                    PPO(env)
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+          ↓                             ↓
+       Actor                         Critic
+          │                             │
+          ↓                             ↓
+Action Distribution                  V(s)
+          │
+          ↓
+       Action
+          │
+          ↓
+      Environment
+          │
+          ↓
+       Reward
+          │
+          └──────────────┐
+                         ↓
+                 collect_rollout()
+                         │
+                         ↓
+                  Rollout Buffer
+                         │
+                         ↓
+              Return / Advantage
+                         │
+                         ↓
+                    PPO Update
+                         │
+                 ┌───────┴───────┐
+                 ↓               ↓
+               Actor           Critic
+                 │               │
+                 └───────┬───────┘
+                         ↓
+                    下一轮训练
 ```
 
-第一版只保留四个核心代码文件：
+最重要的复用关系：
 
-- `main.py` 负责连接组件，不定义网络和 PPO Loss；
-- `model.py` 负责 Actor-Critic，输入和输出维度由环境自动传入；
-- `ppo.py` 负责算法、采样缓存、GAE 和保存加载；
-- `utils.py` 负责跨模块通用工具。
+``` text
+                    PPO
+                     │
+          ┌──────────┴──────────┐
+          ↓                     ↓
+    CartPole-v1          LunarLander-v3
+          │                     │
+    state_dim=4            state_dim=8
+    action_dim=2           action_dim=4
+          │                     │
+          └──────────┬──────────┘
+                     ↓
+              同一套 PPO 算法
+```
 
-暂时不创建 `configs/`、`envs.py`、`rollout.py`、`checkpoint.py`、`plotting.py`、`scripts/` 和复杂的嵌套目录。只有当对应文件确实变长、职责开始混杂时再拆分。
-## 5. PPO 核心实现计划
+> 这里的维度由 Gymnasium 环境实际提供的信息自动读取，不在 PPO 中写死。
 
-### 5.1 网络
+------------------------------------------------------------------------
 
-- 实现共享底层 MLP 的 Actor-Critic，或独立的 Actor/Critic MLP；第一版优先采用共享或清晰的独立实现，保证接口简单。
-- Actor 输出每个离散动作的 logits，并通过 `Categorical` 构造动作分布。
-- Critic 输出单个状态价值 `V(s)`。
-- 网络输入和输出维度从环境空间自动推断，禁止硬编码 CartPole 的维度。
-- 支持配置隐藏层宽度、层数、激活函数和初始化方式。
+# 3. 为什么采用独立 Actor-Critic
 
-### 5.2 轨迹采样
+本实验采用：
 
-- 与环境逐步交互，保存 `observation`、`action`、`reward`、`done`、`log_prob`、`value`、`terminated`、`truncated`。
-- 严格区分 `terminated` 和 `truncated`：
-  - `terminated=True` 表示环境自然终止，后续价值为 0；
-  - `truncated=True` 表示时间截断，需要从最终观测 bootstrap 价值。
-- 每次 rollout 结束后计算最后一个观测的 `V(s)`，为 GAE 和 Return 提供 bootstrap。
-- 支持观测 `float32`、动作 `int64` 和正确设备迁移。
+``` text
+                 State
+                /     \
+               ↓       ↓
+           Actor网络  Critic网络
+               ↓       ↓
+      Action Distribution  V(s)
+               ↓
+             Action
+```
 
-### 5.3 Advantage 与 Return
+即：
 
-- 使用 GAE(lambda) 计算优势：
-  - `delta_t = r_t + gamma * V(s_{t+1}) * (1 - terminated_t) - V(s_t)`
-  - `A_t = delta_t + gamma * lambda * (1 - done_t) * A_{t+1}`
-- Return 使用 `return_t = advantage_t + value_t`。
-- 对 minibatch 内 Advantage 做标准化，降低更新尺度对训练稳定性的影响。
-- 用独立单元测试校验递归方向、终止处理、截断处理和数值结果。
+``` python
+actor = Actor(state_dim, action_dim)
+critic = Critic(state_dim)
+```
 
-### 5.4 PPO 更新目标
+而不是共享 Backbone。
 
-- 保存旧策略的 log probability，计算概率比：
-  - `ratio = exp(new_log_prob - old_log_prob)`
-- 策略损失使用 clipped surrogate：
-  - `L_policy = -min(ratio * A, clip(ratio, 1-epsilon, 1+epsilon) * A).mean()`
-- Critic 使用 value loss，第一版可采用 MSE；是否启用 value clipping 作为配置项。
-- 加入 entropy bonus 鼓励探索，并使用 `value_coef`、`entropy_coef` 控制各项权重。
-- 使用梯度裁剪，避免 LunarLander 训练早期的异常梯度。
-- 每个 rollout 做若干 epoch，再切分 minibatch；记录 approximate KL、clip fraction、policy loss、value loss 和 entropy。
+原因：
 
-### 5.5 训练控制与模型持久化
+1.  Actor 的目标是学习策略 `π(a|s)`。
+2.  Critic 的目标是学习状态价值 `V(s)`。
+3.  两者优化目标不同。
+4.  独立网络更容易理解、调试和展示。
+5.  CartPole 和 LunarLander
+    的网络规模都较小，没有必要为了节省参数而强制共享 Backbone。
 
-- 训练循环使用 `global_step` 驱动，按配置的总 timesteps 停止。
-- 按固定间隔执行 evaluation，并保存最佳模型和最新模型。
-- Checkpoint 至少包含：
-  - 模型 `state_dict`
-  - optimizer `state_dict`
-  - 训练步数
-  - 环境名
-  - 观测/动作维度
-  - 完整超参数配置
-  - 随机种子
-  - 代码和依赖版本信息
-- 加载时校验环境维度和配置，支持从 checkpoint 继续训练或单独评估。
-- 保存/加载后，在固定观测和固定 seed 下比较动作或 value，确保结果一致。
+注意：
 
-## 6. 分阶段执行步骤
+> 本实验并不声称独立网络在所有 PPO
+> 任务中都一定比共享网络效果好。这里只是为了实验结构清晰而采用独立网络。
 
-### 阶段 0：工程环境与基线检查
+------------------------------------------------------------------------
 
-- [ ] 初始化 Git 仓库，补充 `.gitignore`，排除 `.venv/`、checkpoint、运行日志和大体积模型。
-- [ ] 检查 Gymnasium 环境创建、空间类型、reset/step 返回值和渲染后端。
-- [ ] 安装并验证 LunarLander 所需的 Box2D 依赖；若导入失败，优先安装 `gymnasium[box2d]` 及对应构建依赖。
-- [ ] 编写随机策略基线，记录两个环境的随机平均回报和回合长度。
-- [ ] 清理或明确标注现有 SB3 notebook 的用途，避免与最终自研 PPO 主流程混淆。
+# 4. 推荐项目结构
 
-### 阶段 1：最小可运行 PPO
+``` text
+ppo-gym/
+│
+├── pyproject.toml
+├── README.md
+├── Plan.md
+│
+├── src/
+│   └── ppo_gym/
+│       ├── __init__.py
+│       │
+│       ├── networks.py
+│       │
+│       ├── buffer.py
+│       │
+│       ├── ppo.py
+│       │
+│       ├── config.py
+│       │
+│       ├── train.py
+│       │
+│       ├── evaluate.py
+│       │
+│       ├── test.py
+│       │
+│       ├── visualize.py
+│       │
+│       └── utils.py
+│
+├── experiments/
+│   ├── cartpole/
+│   └── lunarlander/
+│
+├── checkpoints/
+│   ├── cartpole/
+│   └── lunarlander/
+│
+├── results/
+│   ├── cartpole/
+│   │   ├── metrics.csv
+│   │   └── curves.png
+│   │
+│   └── lunarlander/
+│       ├── metrics.csv
+│       └── curves.png
+│
+└── videos/
+```
 
-- [ ] 实现配置、环境封装、Actor-Critic、rollout buffer 和 CLI 入口。
-- [ ] 在 `CartPole-v1` 上跑通一次小规模训练，检查张量形状、动作范围和 Loss 是否为有限值。
-- [ ] 实现 GAE、PPO clipped loss、entropy、value loss 和梯度裁剪。
-- [ ] 添加单元测试：网络输出、GAE、PPO ratio/clip、保存加载。
-- [ ] 在小规模运行中检查策略是否持续优于随机策略。
+说明：
 
-### 阶段 2：CartPole-v1 收敛
+-   `src/ppo_gym/`：核心代码。
+-   `experiments/`：不同实验的运行配置或实验记录。
+-   `checkpoints/`：模型权重。
+-   `results/`：训练数据和曲线。
+-   `videos/`：测试时保存的视频。
+-   `Plan.md`：实验方案。
+-   `README.md`：最终使用说明。
 
-- [ ] 使用同一份 PPO 代码训练至稳定收敛。
-- [ ] 定期执行确定性评估，报告 20 或 100 个 episode 的平均回报、标准差和回合长度。
-- [ ] 成功标准：平均回报持续接近 500；不能只以偶然单次 500 分判断成功。
-- [ ] 保存训练曲线、配置、日志和最终模型。
-- [ ] 从保存的 checkpoint 重新加载并复现评估结果。
-- [ ] 在 README 中记录可复现实验命令。
+不要求把每个功能拆成很多文件；上述结构已经足够支持完整实验，同时不会过度工程化。
 
-### 阶段 3：迁移到 LunarLander-v3
+------------------------------------------------------------------------
 
-- [ ] 只新增环境配置和必要参数，不复制或重写 PPO 算法。
-- [ ] 首先跑短程 smoke test，确认观测维度、动作维度、终止/截断语义和渲染正常。
-- [ ] 根据环境规模调整网络宽度、rollout 长度和总训练步数。
-- [ ] 诊断训练问题：若回报不升，依次检查 reward 尺度、GAE、终止 bootstrap、entropy、学习率和梯度范数。
-- [ ] 目标参考：确定性评估平均回报达到 200 左右，并报告 episode 数量与方差；若未达到，完整记录失败实验和原因。
-- [ ] 保存最佳模型、训练曲线、评估日志和加载测试结果。
+# 5. 各文件职责
 
-### 阶段 4：超参数实验
+## 5.1 `networks.py`
 
-- [ ] 先做单变量实验，不同时改变多个核心超参数。
-- [ ] 建议实验维度：学习率、clip epsilon、rollout 长度、minibatch 大小、entropy coefficient、GAE lambda、网络宽度。
-- [ ] 每组实验至少使用多个随机种子，区分性能差异与随机波动。
-- [ ] 汇总结果为表格，并绘制均值曲线和方差带。
-- [ ] 将 Stable-Baselines3 结果作为可选外部基线；只比较，不替换自研核心实现。
-- [ ] 对关键结论给出解释，例如稳定性、样本效率、最终回报和训练时间之间的权衡。
+负责 Actor 和 Critic。
 
-### 阶段 5：测试、可视化与复现
+主要内容：
 
-- [ ] 提供独立的 `evaluate` 命令，加载 checkpoint 后运行确定性和随机策略评估。
-- [ ] 支持 `human` 可视化和 `rgb_array` 视频录制；视频生成失败时不影响核心测试。
-- [ ] 绘制 episode return、episode length、policy loss、value loss、entropy、approx KL 和 clip fraction。
-- [ ] 固化环境、依赖、随机种子、配置和命令，保证同一配置能重复得到相近结果。
-- [ ] README 包含项目结构、安装方式、训练命令、评估命令、结果和已知问题。
-- [ ] 提交清晰的小步 Git commit，避免把大型运行产物直接提交到版本库。
+``` text
+Actor
+Critic
+```
 
-## 7. 初始建议超参数
+### Actor
 
-这些值是起点而不是结论，必须通过实验调整：
+输入：
 
-| 参数 | CartPole 起点 | LunarLander 起点 |
-|---|---:|---:|
-| gamma | 0.99 | 0.99 |
-| lambda | 0.95 | 0.95 |
-| clip epsilon | 0.2 | 0.2 |
-| learning rate | 3e-4 | 2.5e-4 或 3e-4 |
-| rollout steps | 2048 | 2048 |
-| minibatch size | 64 | 64 |
-| update epochs | 10 | 10 |
-| entropy coefficient | 0.01 | 0.001 至 0.01 |
-| value coefficient | 0.5 | 0.5 |
-| max grad norm | 0.5 | 0.5 |
-| hidden size | 64 x 64 | 256 x 256 或 128 x 128 |
-| total timesteps | 200k 至 500k | 1M 至 3M |
+``` text
+State
+```
 
-## 8. 验收标准
+输出：
 
-- [ ] 相同的 PPO 实现仅通过配置即可运行 `CartPole-v1` 和 `LunarLander-v3`。
-- [ ] PPO 训练、GAE、优势估计和裁剪目标均可解释，并通过基础单元测试。
-- [ ] CartPole 能稳定训练到接近满分，而不是仅出现一次高分。
-- [ ] LunarLander 能完成训练并给出明确、可复现的评估结果；若未达到目标回报，必须说明问题和实验证据。
-- [ ] 模型可以保存、重新加载、继续训练或评估，结果具有一致性。
-- [ ] 有训练曲线、评估日志、超参数实验表和可复现命令。
-- [ ] Git 历史能体现项目从环境搭建、最小算法、CartPole 到 LunarLander 的演进。
-- [ ] README 能让另一位同学在新环境中按步骤复现实验。
+``` text
+Action logits
+```
 
-## 9. 主要风险与应对
+结构：
 
-- **LunarLander 依赖缺失**：环境创建可能因 Box2D 安装失败而报错，先解决依赖再调试算法。
-- **GAE/终止处理错误**：错误 bootstrap 或不区分 terminated/truncated 会系统性污染 Advantage，优先用单元测试验证。
-- **训练不稳定**：使用 Advantage 标准化、梯度裁剪、合理 entropy、较小学习率和定期评估。
-- **GPU 反而更慢**：小型 MLP 在 GPU 上的数据传输可能得不偿失，设备应可配置，并比较 CPU/GPU。
-- **只保存模型不保存配置**：checkpoint 必须同时保存配置和版本信息，否则无法可靠复现。
-- **评估结果偶然性过高**：使用固定评估 seed、足够 episode 数和多次随机种子实验。
-- **Notebook 与正式代码脱节**：正式实现以 `src/ppo_gym` 和 CLI 为准，notebook 只用于探索或展示。
+``` text
+State
+  ↓
+Linear
+  ↓
+Activation
+  ↓
+Linear
+  ↓
+Action logits
+```
 
-## 10. 推荐执行顺序
+例如：
 
-1. 先建立 Git、配置、环境封装和测试骨架。
-2. 用随机策略确认两个 Gymnasium 环境接口和依赖都正常。
-3. 实现并验证 Actor-Critic、rollout、GAE 和 PPO clipped loss。
-4. 先在 CartPole 小规模跑通，再调到稳定收敛。
-5. 固化保存加载、评估和绘图流程。
-6. 仅通过配置迁移到 LunarLander，并进行长期训练和问题诊断。
-7. 完成单变量超参数实验、结果汇总和 README。
-8. 最后进行从零复现测试，确认交付物完整。
+``` python
+Actor(state_dim, action_dim)
+```
 
+其中：
+
+-   `state_dim`：由环境决定。
+-   `action_dim`：由环境决定。
+
+不要写死：
+
+``` python
+nn.Linear(4, ...)
+nn.Linear(..., 2)
+```
+
+而应该：
+
+``` python
+nn.Linear(state_dim, ...)
+nn.Linear(..., action_dim)
+```
+
+------------------------------------------------------------------------
+
+### Critic
+
+输入：
+
+``` text
+State
+```
+
+输出：
+
+``` text
+V(s)
+```
+
+结构：
+
+``` text
+State
+  ↓
+Linear
+  ↓
+Activation
+  ↓
+Linear
+  ↓
+1
+```
+
+接口：
+
+``` python
+Critic(state_dim)
+```
+
+输出维度永远是：
+
+``` text
+1
+```
+
+------------------------------------------------------------------------
+
+# 6. `buffer.py`
+
+负责保存一次 rollout 收集的数据。
+
+建议保存：
+
+``` text
+states
+actions
+rewards
+dones
+log_probs
+values
+```
+
+必要时还可以保存：
+
+``` text
+next_states
+```
+
+但如果通过下一状态或 bootstrap value 计算
+GAE，也可以根据实现选择不显式保存全部 `next_states`。
+
+主要类：
+
+``` python
+RolloutBuffer
+```
+
+主要方法：
+
+``` python
+add(...)
+compute_returns_and_advantages(...)
+get(...)
+clear(...)
+```
+
+Buffer 的作用：
+
+``` text
+Environment
+     ↓
+collect_rollout()
+     ↓
+RolloutBuffer
+     ↓
+Advantage / Return
+     ↓
+PPO Update
+```
+
+------------------------------------------------------------------------
+
+# 7. `ppo.py`
+
+这是整个实验的核心。
+
+主要类：
+
+``` python
+PPO
+```
+
+初始化：
+
+``` python
+PPO(env, config)
+```
+
+初始化时自动获取：
+
+``` python
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.n
+```
+
+然后创建：
+
+``` python
+Actor(state_dim, action_dim)
+Critic(state_dim)
+```
+
+因此 PPO 不需要知道自己是在 CartPole 还是 LunarLander 中运行。
+
+------------------------------------------------------------------------
+
+# 8. PPO 的核心方法
+
+## 8.1 `select_action()`
+
+作用：
+
+> 根据当前 Actor 对一个状态选择动作。
+
+流程：
+
+``` text
+State
+  ↓
+Actor
+  ↓
+Action logits
+  ↓
+Categorical Distribution
+  ↓
+Action
+```
+
+同时记录：
+
+``` text
+action
+log_prob
+value
+```
+
+因为 PPO 后面需要旧策略的 `log_prob` 和 Critic 的 `V(s)`。
+
+------------------------------------------------------------------------
+
+## 8.2 `collect_rollout()`
+
+### 定义
+
+`collect_rollout()` 是 PPO 的**数据采集阶段**。
+
+它不是 PPO 的独立算法，而是负责：
+
+> 使用当前策略与环境交互，收集一批训练数据。
+
+核心流程：
+
+``` text
+当前 Actor
+    ↓
+读取 State
+    ↓
+选择 Action
+    ↓
+env.step(Action)
+    ↓
+得到：
+next_state
+reward
+done
+    ↓
+保存数据
+    ↓
+继续交互
+```
+
+收集：
+
+``` text
+state
+action
+reward
+done
+log_prob
+value
+```
+
+伪代码：
+
+``` python
+def collect_rollout(self):
+    buffer.clear()
+
+    for _ in range(rollout_steps):
+        action, log_prob, value = self.select_action(state)
+
+        next_state, reward, terminated, truncated, _ = \
+            env.step(action)
+
+        done = terminated or truncated
+
+        buffer.add(
+            state,
+            action,
+            reward,
+            done,
+            log_prob,
+            value
+        )
+
+        state = next_state
+
+        if done:
+            state, _ = env.reset()
+```
+
+------------------------------------------------------------------------
+
+# 9. 为什么 PPO 需要 Rollout
+
+PPO 不是：
+
+``` text
+state
+ ↓
+action
+ ↓
+马上更新
+```
+
+而是：
+
+``` text
+状态
+ ↓
+动作
+ ↓
+奖励
+ ↓
+状态
+ ↓
+动作
+ ↓
+奖励
+ ↓
+...
+ ↓
+收集一批数据
+ ↓
+计算 Advantage
+ ↓
+PPO Update
+```
+
+所以 PPO 的训练循环可以概括为：
+
+``` text
+Collect
+  ↓
+Estimate
+  ↓
+Update
+  ↓
+Collect
+  ↓
+Estimate
+  ↓
+Update
+  ↓
+...
+```
+
+------------------------------------------------------------------------
+
+# 10. `compute_advantage()`
+
+PPO 使用 Advantage 判断：
+
+> 当前采取的动作，比 Critic 原本对这个状态的预期好多少？
+
+核心：
+
+``` text
+Advantage
+=
+实际表现
+-
+Critic预测
+```
+
+本实验推荐使用 GAE：
+
+``` text
+GAE(Generalized Advantage Estimation)
+```
+
+核心公式：
+
+``` text
+δ_t = r_t + γ V(s_{t+1}) - V(s_t)
+```
+
+然后：
+
+``` text
+A_t = δ_t + γλδ_{t+1} + (γλ)^2δ_{t+2} + ...
+```
+
+其中：
+
+-   `γ`：discount factor。
+-   `λ`：GAE 参数。
+-   `V(s)`：Critic 对状态价值的估计。
+
+------------------------------------------------------------------------
+
+# 11. Return
+
+Critic 的训练目标需要 Return：
+
+``` text
+G_t = r_t + γr_{t+1} + γ²r_{t+2} + ...
+```
+
+可以理解为：
+
+``` text
+Return
+=
+从当前状态开始，未来累计折扣奖励
+```
+
+最终：
+
+``` text
+Critic:
+V(s) → Return
+```
+
+------------------------------------------------------------------------
+
+# 12. PPO Update
+
+这是 PPO 真正进行参数更新的地方。
+
+对于 Actor：
+
+``` text
+旧策略概率
+      ↓
+ratio
+      ↓
+clipped objective
+      ↓
+Actor loss
+      ↓
+反向传播
+      ↓
+Actor 更新
+```
+
+核心概率比：
+
+``` text
+r_t(θ)
+=
+π_θ(a_t|s_t)
+/
+π_old(a_t|s_t)
+```
+
+PPO 的核心思想：
+
+``` text
+不要让新策略相对于旧策略变化太大
+```
+
+因此使用：
+
+``` text
+clip(r_t, 1-ε, 1+ε)
+```
+
+Actor 的 PPO clipped objective：
+
+``` text
+L^CLIP
+=
+E[
+min(
+r_t A_t,
+clip(r_t, 1-ε, 1+ε) A_t
+)
+]
+```
+
+实现时通常使用最小化 loss，因此：
+
+``` text
+actor_loss = -mean(
+    min(
+        ratio * advantage,
+        clipped_ratio * advantage
+    )
+)
+```
+
+------------------------------------------------------------------------
+
+# 13. Critic Update
+
+Critic：
+
+``` text
+V(s)
+```
+
+目标：
+
+``` text
+Return
+```
+
+通常：
+
+``` text
+critic_loss
+=
+MSE(V(s), Return)
+```
+
+所以：
+
+``` text
+Actor:
+State → Action Distribution
+              ↓
+         PPO Objective
+
+Critic:
+State → V(s)
+          ↓
+       Return
+```
+
+------------------------------------------------------------------------
+
+# 14. Entropy
+
+Actor 可以加入 entropy bonus：
+
+``` text
+Entropy
+```
+
+作用：
+
+> 鼓励策略保持一定探索能力，避免过早变得过于确定。
+
+总 loss 可以写成：
+
+``` text
+loss =
+actor_loss
++
+value_coef * critic_loss
+-
+entropy_coef * entropy
+```
+
+------------------------------------------------------------------------
+
+# 15. `train()`
+
+训练流程：
+
+``` text
+reset environment
+       ↓
+collect_rollout()
+       ↓
+compute advantages / returns
+       ↓
+PPO update
+       ↓
+记录 metrics
+       ↓
+evaluate
+       ↓
+保存 best model
+       ↓
+重复
+```
+
+建议训练以：
+
+``` text
+rollout
+```
+
+或者：
+
+``` text
+update
+```
+
+作为主要训练单位，而不是强制以单 episode 作为 PPO 更新单位。
+
+------------------------------------------------------------------------
+
+# 16. `config.py`
+
+集中保存超参数。
+
+推荐：
+
+``` python
+@dataclass
+class PPOConfig:
+    learning_rate: float = 3e-4
+
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+
+    clip_epsilon: float = 0.2
+
+    update_epochs: int = 10
+    batch_size: int = 64
+    rollout_steps: int = 2048
+
+    value_coef: float = 0.5
+    entropy_coef: float = 0.01
+
+    max_grad_norm: float = 0.5
+```
+
+------------------------------------------------------------------------
+
+# 17. 超参数说明
+
+## 17.1 Learning Rate
+
+``` text
+learning_rate
+```
+
+控制网络参数每次更新的幅度。
+
+推荐基础值：
+
+``` text
+3e-4
+```
+
+实验可以比较：
+
+``` text
+1e-4
+3e-4
+1e-3
+```
+
+------------------------------------------------------------------------
+
+## 17.2 Gamma
+
+``` text
+gamma = 0.99
+```
+
+决定未来奖励的重要程度。
+
+越接近 1：
+
+``` text
+更重视长期奖励
+```
+
+越小：
+
+``` text
+更重视近期奖励
+```
+
+建议基础实验：
+
+``` text
+0.99
+```
+
+如果做参数实验：
+
+``` text
+0.95
+0.99
+```
+
+------------------------------------------------------------------------
+
+## 17.3 GAE Lambda
+
+``` text
+gae_lambda = 0.95
+```
+
+控制 Advantage 估计中的偏差-方差权衡。
+
+建议：
+
+``` text
+0.90
+0.95
+0.99
+```
+
+------------------------------------------------------------------------
+
+## 17.4 Clip Epsilon
+
+``` text
+clip_epsilon = 0.2
+```
+
+决定 PPO 对策略更新幅度的限制。
+
+常用基础值：
+
+``` text
+0.2
+```
+
+实验：
+
+``` text
+0.1
+0.2
+0.3
+```
+
+------------------------------------------------------------------------
+
+## 17.5 Rollout Steps
+
+``` text
+rollout_steps = 2048
+```
+
+表示一次收集多少个时间步的数据。
+
+较大：
+
+``` text
+数据更多
+更新更稳定
+但单次更新等待更久
+```
+
+较小：
+
+``` text
+更新更频繁
+但数据可能更加噪声化
+```
+
+对于 CartPole 可以使用较小值进行快速实验；最终统一实验时再设置固定值。
+
+------------------------------------------------------------------------
+
+## 17.6 Update Epochs
+
+``` text
+update_epochs = 10
+```
+
+表示同一批 rollout 数据被重复训练多少轮。
+
+建议基础值：
+
+``` text
+10
+```
+
+------------------------------------------------------------------------
+
+## 17.7 Batch Size
+
+``` text
+batch_size = 64
+```
+
+将 rollout 数据划分成 mini-batch。
+
+------------------------------------------------------------------------
+
+## 17.8 Value Coefficient
+
+``` text
+value_coef = 0.5
+```
+
+控制 Critic loss 对总 loss 的影响。
+
+------------------------------------------------------------------------
+
+## 17.9 Entropy Coefficient
+
+``` text
+entropy_coef = 0.01
+```
+
+控制探索奖励。
+
+如果过高：
+
+``` text
+策略可能长期保持随机
+```
+
+如果过低：
+
+``` text
+可能过早失去探索
+```
+
+------------------------------------------------------------------------
+
+## 17.10 Max Grad Norm
+
+``` text
+max_grad_norm = 0.5
+```
+
+用于梯度裁剪，提高训练稳定性。
+
+------------------------------------------------------------------------
+
+# 18. 推荐的基础参数
+
+第一阶段不要调参，先使用一组固定参数验证 PPO：
+
+``` text
+learning_rate = 3e-4
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+update_epochs = 10
+batch_size = 64
+rollout_steps = 2048
+value_coef = 0.5
+entropy_coef = 0.01
+max_grad_norm = 0.5
+```
+
+注意：
+
+> 这是一套实验起始配置，不应在没有实际运行结果的情况下声称它对两个环境都是最优配置。
+
+------------------------------------------------------------------------
+
+# 19. `evaluate.py`
+
+评估与训练分开。
+
+核心方法：
+
+``` python
+evaluate(agent, env, episodes)
+```
+
+评估阶段：
+
+``` text
+不更新 Actor
+不更新 Critic
+不进行反向传播
+```
+
+只执行：
+
+``` text
+State
+ ↓
+Actor
+ ↓
+Action
+ ↓
+Environment
+ ↓
+Reward
+```
+
+最终计算：
+
+``` text
+mean reward
+std reward
+episode rewards
+```
+
+建议每隔若干次 PPO update 进行一次评估。
+
+------------------------------------------------------------------------
+
+# 20. 模型保存
+
+保存：
+
+``` text
+checkpoints/
+├── cartpole/
+│   └── best.pth
+│
+└── lunarlander/
+    └── best.pth
+```
+
+至少保存：
+
+``` python
+{
+    "actor": actor.state_dict(),
+    "critic": critic.state_dict()
+}
+```
+
+如果需要断点继续训练，可以额外保存：
+
+``` text
+actor optimizer
+critic optimizer
+training step
+config
+```
+
+实验阶段建议保存：
+
+``` text
+best model
+latest model
+```
+
+其中：
+
+-   `best model`：评估 reward 最好的模型。
+-   `latest model`：最近一次训练状态。
+
+------------------------------------------------------------------------
+
+# 21. `train.py`
+
+负责启动训练。
+
+推荐接口：
+
+``` python
+def train(env_name, config):
+    env = gym.make(env_name)
+
+    agent = PPO(env, config)
+
+    ...
+```
+
+运行：
+
+``` python
+train("CartPole-v1", config)
+```
+
+或者：
+
+``` python
+train("LunarLander-v3", config)
+```
+
+关键要求：
+
+> 除了环境名称和实验配置之外，不修改 PPO 算法。
+
+------------------------------------------------------------------------
+
+# 22. CartPole 实验
+
+## 目标
+
+验证：
+
+> PPO 的基本实现是否正确。
+
+环境：
+
+``` text
+CartPole-v1
+```
+
+状态：
+
+``` text
+4-dimensional
+```
+
+动作：
+
+``` text
+2 discrete actions
+```
+
+实验流程：
+
+``` text
+CartPole-v1
+    ↓
+PPO(env)
+    ↓
+自动读取 state_dim/action_dim
+    ↓
+训练
+    ↓
+记录 reward
+    ↓
+绘制 reward curve
+    ↓
+evaluate
+    ↓
+保存 best model
+```
+
+CartPole 的意义：
+
+> 如果一个基本 PPO 实现连 CartPole
+> 都无法稳定学习，应优先检查算法实现、数据处理、GAE、ratio、clip、done
+> 处理等，而不是直接增加复杂技巧。
+
+------------------------------------------------------------------------
+
+# 23. LunarLander 实验
+
+环境：
+
+``` text
+LunarLander-v3
+```
+
+不重新实现 PPO。
+
+只更换：
+
+``` python
+env = gym.make("LunarLander-v3")
+```
+
+然后：
+
+``` python
+agent = PPO(env, config)
+```
+
+PPO 自动获取：
+
+``` text
+state_dim
+action_dim
+```
+
+网络自动适配。
+
+实验目标：
+
+> 验证 PPO
+> 从简单环境迁移到状态和奖励结构更加复杂的环境后，代码是否仍然能够工作。
+
+------------------------------------------------------------------------
+
+# 24. 两个环境的代码复用原则
+
+禁止：
+
+``` python
+if env_name == "CartPole-v1":
+    # 一套 PPO
+
+elif env_name == "LunarLander-v3":
+    # 另一套 PPO
+```
+
+推荐：
+
+``` python
+env = gym.make(env_name)
+agent = PPO(env, config)
+agent.train()
+```
+
+PPO 内部：
+
+``` python
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.n
+```
+
+这样：
+
+``` text
+Environment
+     ↓
+提供 observation_space / action_space
+     ↓
+PPO 自动构建网络
+```
+
+------------------------------------------------------------------------
+
+# 25. `utils.py`
+
+用于放一些不属于 PPO 核心算法的通用功能。
+
+例如：
+
+``` python
+set_seed(...)
+save_checkpoint(...)
+load_checkpoint(...)
+moving_average(...)
+save_metrics(...)
+```
+
+可以包含：
+
+``` text
+随机种子
+日志保存
+模型保存辅助函数
+数据处理
+曲线数据处理
+```
+
+不要把 PPO 核心算法塞进 `utils.py`。
+
+------------------------------------------------------------------------
+
+# 26. 训练指标
+
+训练过程中建议记录：
+
+``` text
+episode_reward
+episode_length
+evaluation_reward
+actor_loss
+critic_loss
+entropy
+approx_kl
+```
+
+最核心：
+
+``` text
+episode_reward
+evaluation_reward
+```
+
+辅助分析：
+
+``` text
+actor_loss
+critic_loss
+entropy
+```
+
+------------------------------------------------------------------------
+
+# 27. 训练曲线
+
+至少绘制：
+
+``` text
+Reward vs Episode
+```
+
+推荐：
+
+``` text
+原始 reward
++
+移动平均 reward
+```
+
+例如：
+
+``` text
+Reward
+  │
+  │                 ╭──────
+  │            ╭────╯
+  │       ╭────╯
+  │  ╭────╯
+  │──╯
+  └────────────────────── Episode
+```
+
+这样更容易判断训练趋势。
+
+------------------------------------------------------------------------
+
+# 28. 评估曲线
+
+如果训练过程中周期性评估：
+
+``` text
+Evaluation Reward vs Update
+```
+
+可以得到：
+
+``` text
+Update
+  │
+  │              ╭─────
+  │         ╭────╯
+  │    ╭────╯
+  │────╯
+  └────────────────────
+```
+
+相比单个 episode reward，更适合观察策略性能。
+
+------------------------------------------------------------------------
+
+# 29. 超参数实验设计
+
+不要一开始同时改变所有参数。
+
+推荐：
+
+## 实验 0：Baseline
+
+``` text
+固定基础参数
+```
+
+目标：
+
+``` text
+CartPole 能训练
+LunarLander 能训练
+```
+
+------------------------------------------------------------------------
+
+## 实验 1：Learning Rate
+
+``` text
+1e-4
+3e-4
+1e-3
+```
+
+保持其他参数完全一致。
+
+比较：
+
+``` text
+训练曲线
+最终评估 reward
+训练稳定性
+```
+
+------------------------------------------------------------------------
+
+## 实验 2：Clip Epsilon
+
+``` text
+0.1
+0.2
+0.3
+```
+
+保持其他参数一致。
+
+------------------------------------------------------------------------
+
+## 实验 3：GAE Lambda
+
+``` text
+0.90
+0.95
+0.99
+```
+
+保持其他参数一致。
+
+------------------------------------------------------------------------
+
+# 30. 超参数实验控制变量原则
+
+每次实验：
+
+``` text
+只改变一个主要超参数
+```
+
+例如：
+
+``` text
+实验 A
+lr = 1e-4
+gamma = 0.99
+lambda = 0.95
+epsilon = 0.2
+
+实验 B
+lr = 3e-4
+gamma = 0.99
+lambda = 0.95
+epsilon = 0.2
+
+实验 C
+lr = 1e-3
+gamma = 0.99
+lambda = 0.95
+epsilon = 0.2
+```
+
+这样才能知道：
+
+> 性能变化主要来自哪个参数。
+
+------------------------------------------------------------------------
+
+# 31. 随机种子
+
+强化学习存在随机性。
+
+因此正式比较超参数时，不应该只跑一次。
+
+推荐：
+
+``` text
+seed = 0
+seed = 1
+seed = 2
+```
+
+如果计算资源有限，普通课程实验至少可以：
+
+``` text
+2~3 seeds
+```
+
+然后报告：
+
+``` text
+mean reward
+std reward
+```
+
+不要只比较某一次运行的最高 reward。
+
+------------------------------------------------------------------------
+
+# 32. 模型测试
+
+训练结束后：
+
+``` text
+加载 best checkpoint
+       ↓
+创建测试环境
+       ↓
+Actor 推理
+       ↓
+执行 Action
+       ↓
+记录 Reward
+```
+
+测试环境可以：
+
+``` python
+env = gym.make(
+    "CartPole-v1",
+    render_mode="human"
+)
+```
+
+或者：
+
+``` python
+env = gym.make(
+    "LunarLander-v3",
+    render_mode="human"
+)
+```
+
+------------------------------------------------------------------------
+
+# 33. 可视化
+
+测试阶段使用：
+
+``` text
+render_mode="human"
+```
+
+直接观察智能体行为。
+
+也可以使用：
+
+``` text
+render_mode="rgb_array"
+```
+
+然后保存视频。
+
+推荐最终展示：
+
+``` text
+训练曲线
++
+测试运行视频
+```
+
+这样实验结果同时包含：
+
+``` text
+定量结果
+```
+
+和：
+
+``` text
+定性结果
+```
+
+------------------------------------------------------------------------
+
+# 34. `test.py`
+
+主要负责：
+
+``` python
+load_model(...)
+test(...)
+```
+
+典型流程：
+
+``` text
+读取 checkpoint
+      ↓
+创建环境
+      ↓
+创建 PPO
+      ↓
+加载 Actor / Critic
+      ↓
+运行 N 个 episode
+      ↓
+记录 reward
+      ↓
+输出：
+mean
+std
+min
+max
+```
+
+测试时不要更新模型。
+
+------------------------------------------------------------------------
+
+# 35. `visualize.py`
+
+负责测试过程的可视化。
+
+可以提供：
+
+``` python
+run_visualization(...)
+```
+
+功能：
+
+``` text
+加载模型
+创建 render 环境
+运行 episode
+展示智能体行为
+```
+
+如果保存视频，则使用 Gymnasium 的录制工具完成。
+
+------------------------------------------------------------------------
+
+# 36. 最终完整实验流程
+
+``` text
+                开始
+                  │
+                  ↓
+        创建 Gymnasium Environment
+                  │
+                  ↓
+              PPO(env)
+                  │
+                  ↓
+        自动获取 state_dim
+        自动获取 action_dim
+                  │
+                  ↓
+       创建 Actor + Critic
+                  │
+                  ↓
+          ┌───────────────┐
+          │   Training    │
+          └───────┬───────┘
+                  │
+                  ↓
+         collect_rollout()
+                  │
+                  ↓
+          Rollout Buffer
+                  │
+                  ↓
+       Return + GAE Advantage
+                  │
+                  ↓
+             PPO Update
+                  │
+          ┌───────┴───────┐
+          ↓               ↓
+        Actor           Critic
+          │               │
+          └───────┬───────┘
+                  ↓
+             记录 Metrics
+                  │
+                  ↓
+             Periodic Eval
+                  │
+                  ↓
+            是否 Best Model?
+             /          \
+           Yes           No
+            │             │
+            ↓             │
+       Save Checkpoint    │
+            │             │
+            └──────┬──────┘
+                   ↓
+              继续训练
+                   │
+                   ↓
+              训练完成
+                   │
+                   ↓
+             最终评估
+                   │
+                   ↓
+              加载 Best
+                   │
+                   ↓
+             模型测试
+                   │
+                   ↓
+             可视化运行
+                   │
+                   ↓
+              实验结果
+```
+
+------------------------------------------------------------------------
+
+# 37. 最终项目结构图
+
+``` text
+ppo-gym/
+│
+├── Plan.md
+├── README.md
+├── pyproject.toml
+│
+├── src/
+│   └── ppo_gym/
+│       │
+│       ├── __init__.py
+│       │
+│       ├── networks.py
+│       │      ├── Actor
+│       │      └── Critic
+│       │
+│       ├── buffer.py
+│       │      └── RolloutBuffer
+│       │
+│       ├── config.py
+│       │      └── PPOConfig
+│       │
+│       ├── ppo.py
+│       │      └── PPO
+│       │          ├── select_action()
+│       │          ├── collect_rollout()
+│       │          ├── compute_advantage()
+│       │          ├── update()
+│       │          └── train()
+│       │
+│       ├── train.py
+│       │      └── 训练入口
+│       │
+│       ├── evaluate.py
+│       │      └── evaluate()
+│       │
+│       ├── test.py
+│       │      └── test()
+│       │
+│       ├── visualize.py
+│       │      └── run_visualization()
+│       │
+│       └── utils.py
+│              ├── seed
+│              ├── checkpoint
+│              └── metrics
+│
+├── experiments/
+│   ├── cartpole/
+│   └── lunarlander/
+│
+├── checkpoints/
+│   ├── cartpole/
+│   │   ├── best.pth
+│   │   └── latest.pth
+│   │
+│   └── lunarlander/
+│       ├── best.pth
+│       └── latest.pth
+│
+├── results/
+│   ├── cartpole/
+│   │   ├── metrics.csv
+│   │   └── curves.png
+│   │
+│   └── lunarlander/
+│       ├── metrics.csv
+│       └── curves.png
+│
+└── videos/
+    ├── cartpole/
+    └── lunarlander/
+```
+
+------------------------------------------------------------------------
+
+# 38. 文件依赖关系
+
+``` text
+                     train.py
+                         │
+                         ↓
+                    PPO(env)
+                         │
+          ┌──────────────┼──────────────┐
+          ↓              ↓              ↓
+      networks.py    buffer.py      config.py
+          │              │
+      ┌───┴───┐          │
+      ↓       ↓          │
+    Actor   Critic        │
+      │       │           │
+      └───┬───┘           │
+          ↓               ↓
+             ppo.py
+                │
+       ┌────────┼────────┐
+       ↓        ↓        ↓
+    rollout   GAE     update
+                │
+                ↓
+            metrics
+                │
+        ┌───────┴────────┐
+        ↓                ↓
+ evaluate.py          utils.py
+        │                │
+        ↓                ↓
+ test.py           checkpoints/results
+        │
+        ↓
+ visualize.py
+```
+
+------------------------------------------------------------------------
+
+# 39. 最重要的代码复用验证
+
+最终应该能够做到：
+
+## CartPole
+
+``` python
+env = gym.make("CartPole-v1")
+
+agent = PPO(env, config)
+
+agent.train()
+```
+
+## LunarLander
+
+``` python
+env = gym.make("LunarLander-v3")
+
+agent = PPO(env, config)
+
+agent.train()
+```
+
+两者之间：
+
+``` text
+PPO代码：不变
+Actor代码：不变
+Critic代码：不变
+Buffer代码：不变
+GAE代码：不变
+Update代码：不变
+Evaluate代码：不变
+Test代码：不变
+```
+
+变化的主要是：
+
+``` text
+环境名称
+实验配置
+模型保存路径
+结果保存路径
+```
+
+------------------------------------------------------------------------
+
+# 40. 推荐实现顺序
+
+不要一次把所有功能全部写完。
+
+按照下面顺序实现：
+
+``` text
+Step 1
+Gymnasium 环境创建
+        ↓
+Step 2
+Actor
+        ↓
+Step 3
+Critic
+        ↓
+Step 4
+PPO select_action()
+        ↓
+Step 5
+RolloutBuffer
+        ↓
+Step 6
+collect_rollout()
+        ↓
+Step 7
+Return + GAE
+        ↓
+Step 8
+PPO clipped update
+        ↓
+Step 9
+CartPole 训练
+        ↓
+Step 10
+训练曲线
+        ↓
+Step 11
+Evaluate
+        ↓
+Step 12
+Checkpoint
+        ↓
+Step 13
+LunarLander 迁移
+        ↓
+Step 14
+模型测试 + 可视化
+        ↓
+Step 15
+超参数实验
+```
+
+------------------------------------------------------------------------
+
+# 41. 实验完成后的最终成果
+
+最终应该能够得到：
+
+## 算法
+
+``` text
+PPO
+Actor
+Critic
+GAE
+Clipping
+Entropy
+```
+
+## 环境
+
+``` text
+CartPole-v1
+LunarLander-v3
+```
+
+## 训练
+
+``` text
+Training Reward
+Evaluation Reward
+Loss
+Entropy
+```
+
+## 模型
+
+``` text
+best.pth
+latest.pth
+```
+
+## 实验
+
+``` text
+Baseline
+Learning Rate
+Clip Epsilon
+GAE Lambda
+```
+
+## 测试
+
+``` text
+平均 Reward
+Reward 标准差
+测试 Episode
+```
+
+## 可视化
+
+``` text
+训练曲线
+评估曲线
+智能体运行效果
+```
+
+------------------------------------------------------------------------
+
+# 42. 最终核心脉络
+
+整个项目最终可以压缩成这一条线：
+
+``` text
+Gymnasium Environment
+        ↓
+      State
+        ↓
+      Actor ─────────→ Action
+        │                 ↓
+        │             Environment
+        │                 ↓
+        │              Reward
+        │                 ↓
+        └──────→ Rollout Buffer
+                         ↓
+                    Critic V(s)
+                         ↓
+                  GAE Advantage
+                         ↓
+                  PPO Clipping
+                         ↓
+                Actor + Critic Update
+                         ↓
+                    新策略
+                         ↓
+                    下一轮 Rollout
+```
+
+而整个实验的核心验证是：
+
+``` text
+        同一个 PPO
+             │
+       ┌─────┴─────┐
+       ↓           ↓
+   CartPole    LunarLander
+       │           │
+       ↓           ↓
+   验证正确性   验证迁移能力
+```
+
+这就是本项目最核心的设计原则：
+
+> **环境变化，但 PPO 算法不变。**
