@@ -1,4 +1,4 @@
-"""评估模块(Plan §19)。
+"""评估模块。
 
 评估与训练严格分开:
 - 不更新 Actor;
@@ -7,7 +7,7 @@
 - 使用确定性动作(argmax)而非采样。
 
 训练时每隔 eval_interval 次 PPO update 调用一次本模块,
-评估结果用于 best model 判定和评估曲线(Plan §28)。
+评估结果用于 best model 判定和评估曲线。
 """
 
 from __future__ import annotations

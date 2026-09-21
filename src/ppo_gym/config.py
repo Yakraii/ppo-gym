@@ -1,6 +1,6 @@
 """PPO 超参数的集中配置。
-按照 Plan.md §16 的设计,所有可调超参数都集中在这个 dataclass 中,
-训练、评估、测试和实验脚本统一从这里读取配置,
+所有可调超参数都集中在这个 dataclass 中,
+训练、评估、测试和实验脚本统一从这里读取配置。
 """
 
 from __future__ import annotations
@@ -15,26 +15,25 @@ class PPOConfig:
     字段含义:
         env_name        环境名称,例如 "CartPole-v1" 或 "LunarLander-v3"。
         total_steps     训练总环境步数,训练循环的主结束条件。
-        seed            随机种子,保证实验可复现(Plan §31)。
+        seed            随机种子,保证实验可复现。
         device          计算设备,"auto" / "cpu" / "cuda"。
 
-        rollout_steps   一次 rollout 收集多少个时间步(Plan §17.5)。
-        update_epochs   同一批 rollout 数据重复训练多少轮(Plan §17.6)。
-        batch_size      mini-batch 大小,rollout 数据被切分训练(Plan §17.7)。
+        rollout_steps   一次 rollout 收集多少个时间步。
+        update_epochs   同一批 rollout 数据重复训练多少轮。
+        batch_size      mini-batch 大小,rollout 数据被切分训练。
 
-        learning_rate   学习率,推荐基础值 3e-4(Plan §17.1)。
+        learning_rate   学习率,推荐基础值 3e-4。
         adam_eps        Adam 优化器的 eps(CleanRL 经验:1e-5 比
                         PyTorch 默认的 1e-8 在小网络上更稳定)。
-        gamma           折扣因子,推荐 0.99(Plan §17.2)。
-        gae_lambda      GAE 的 lambda,控制偏差-方差权衡(Plan §17.3)。
-        clip_epsilon    PPO 裁剪系数 epsilon,推荐 0.2(Plan §17.4)。
+        gamma           折扣因子,推荐 0.99。
+        gae_lambda      GAE 的 lambda,控制偏差-方差权衡。
+        clip_epsilon    PPO 裁剪系数 epsilon,推荐 0.2。
 
-        value_coef      Critic loss 在总 loss 中的权重(Plan §17.8)。
-        entropy_coef    熵奖励系数,控制探索强度(Plan §17.9)。
-        max_grad_norm   梯度裁剪上限,提高训练稳定性(Plan §17.10)。
+        value_coef      Critic loss 在总 loss 中的权重。
+        entropy_coef    熵奖励系数,控制探索强度。
+        max_grad_norm   梯度裁剪上限,提高训练稳定性。
 
-        hidden_sizes    Actor 和 Critic 共用的 MLP 隐藏层宽度序列。
-        eval_interval   每隔多少次 PPO update 做一次周期评估(Plan §19)。
+        eval_interval   每隔多少次 PPO update 做一次周期评估。
         eval_episodes   每次周期评估运行的回合数。
     """
 
@@ -57,6 +56,5 @@ class PPOConfig:
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
 
-    hidden_sizes: tuple[int, ...] = (64, 64)
     eval_interval: int = 10
     eval_episodes: int = 5

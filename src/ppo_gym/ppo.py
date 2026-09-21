@@ -1,15 +1,9 @@
-"""PPO 算法核心:整个实验最重要的文件(Plan §7~§15)。
+"""PPO 算法核心
 
-设计约束:
-- PPO 在初始化时自动从环境读取 state_dim / action_dim,
-  因此它不需要知道自己运行在 CartPole 还是 LunarLander 中;
-- 除了环境名称和实验配置,迁移环境时不允许修改本文件(Plan §24);
-- 禁止出现 if env_name == "CartPole-v1" 之类的分支。
-
-训练主循环(Plan §9):
+训练主循环:
     Collect → Estimate → Update → Collect → Estimate → Update → ...
 
-从 CleanRL(cleanrl_ppo.py)吸收的实现细节:
+ CleanRL:
 - Adam 优化器 eps=1e-5,小网络下比默认 1e-8 更稳定;
 - approx_kl 使用 k3 估计 ((ratio-1) - logratio).mean(),数值上比
   (-logratio).mean() 更稳定;
@@ -17,27 +11,25 @@
 - 每个 mini-batch 内独立做 advantage 标准化;
 - 每轮 epoch 重新打乱数据。
 
-刻意不采用的 CleanRL 内容(与项目要求冲突,见对照分析):
-tyro / wandb / TensorBoard / 向量化环境 / 学习率退火 /
-裁剪价值损失 clip_vloss / target_kl 提前停止。
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
 import torch
+from torch import nn
 from torch.distributions import Categorical
 
-from .buffer import RolloutBuffer
 from .config import PPOConfig
 from .evaluate import evaluate
-from .networks import Actor, Critic
 from .utils import (
     env_dir_name,
+    plot_diagnostics,
     plot_evaluation_curve,
     plot_training_curve,
     resolve_device,
@@ -46,18 +38,182 @@ from .utils import (
 )
 
 
+def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Linear:
+    """对单个 Linear 层做正交初始化(CleanRL 经验)。
+
+    隐藏层用 std=√2(Tanh 激活的标准选择);
+    输出层的 std 由调用方显式指定(Actor 0.01 / Critic 1.0)。
+    """
+
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
+class Agent(nn.Module):
+    """Actor-Critic 网络:独立的 Actor 和 Critic 两个 MLP(CleanRL 风格)。
+
+    Critic 输出层 std=1.0(价值量级不确定,不做收缩);
+    Actor 输出层 std=0.01(初始 logits 几乎全 0,策略接近均匀随机)。
+    """
+
+    def __init__(self, state_dim: int, action_dim: int) -> None:
+        """state_dim / action_dim 由 PPO 从环境自动读入,不写死具体环境的维度。"""
+
+        super().__init__()
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(state_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 1), std=1.0),
+        )
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(state_dim, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, 64)),
+            nn.Tanh(),
+            layer_init(nn.Linear(64, action_dim), std=0.01),
+        )
+
+
+class RolloutBuffer:
+    """保存一次 rollout 的数据,计算 GAE Advantage / Return,按 mini-batch 随机产出。
+
+    不显式保存 next_states:GAE 通过"下一时刻的 value + 末端 bootstrap
+    value"计算(与 CleanRL 一致)。严格区分 terminated 和 truncated:
+    terminated 的下一状态价值为 0;truncated 必须用截断观测的
+    bootstrap_values(采样现场算好,reset 之后观测就丢了)。
+    """
+
+    def __init__(self) -> None:
+        self.states: list = []
+        self.actions: list[int] = []
+        self.rewards: list[float] = []
+        self.log_probs: list[float] = []
+        self.values: list[float] = []
+        self.terminateds: list[bool] = []
+        self.truncateds: list[bool] = []
+        self.bootstrap_values: list[float] = []
+        self.advantages: np.ndarray | None = None
+        self.returns: np.ndarray | None = None
+
+    def add(
+        self,
+        state,
+        action: int,
+        reward: float,
+        log_prob: float,
+        value: float,
+        terminated: bool,
+        truncated: bool,
+        bootstrap_value: float = 0.0, # 不必要的时候 0 就行
+    ) -> None:
+        """追加一个时间步;bootstrap_value 仅 truncated=True 时需要传入。"""
+
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(float(reward))
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.terminateds.append(terminated)
+        self.truncateds.append(truncated)
+        self.bootstrap_values.append(bootstrap_value)
+
+    def clear(self) -> None:
+        """清空所有字段,每个新 rollout 开始时调用。"""
+
+        for name in (
+            "states", "actions", "rewards", "log_probs", "values",
+            "terminateds", "truncateds", "bootstrap_values",
+        ):
+            getattr(self, name).clear()
+        self.advantages = None
+        self.returns = None
+
+    def compute_returns_and_advantages(
+        self, last_value, gamma: float, gae_lambda: float
+    ) -> None:
+        """逆序递推 GAE,结果存入 self.advantages / self.returns。
+
+        next_value 的取法:truncated → 截断观测的 bootstrap 价值;
+        最后一步 → last_value;其余 → values[t+1]。
+        terminated 屏蔽下一状态价值;λ 递推用 (1 - done),
+        无论终止还是截断,优势都不跨回合传递。
+        """
+
+        rewards = np.asarray(self.rewards, dtype=np.float32)
+        values = np.asarray(self.values, dtype=np.float32)
+        terminateds = np.asarray(self.terminateds, dtype=np.float32)
+        truncateds = np.asarray(self.truncateds, dtype=np.float32)
+        dones = np.maximum(terminateds, truncateds)
+        last_value = float(last_value)
+
+        advantages = np.zeros_like(rewards)
+        last_gae = 0.0
+        for step in reversed(range(len(rewards))):
+            if truncateds[step] > 0:
+            # 符合截断的情况的话
+                next_value = self.bootstrap_values[step]
+            elif step == len(rewards) - 1:
+            # rollout最后一个但是后面本来还有value
+                next_value = last_value
+            else:
+            # 中间步
+                next_value = values[step + 1]
+
+            delta = (
+                rewards[step]
+                + gamma * next_value * (1.0 - terminateds[step])
+                - values[step]
+            )
+            # 如果是最后一个就是自己的delta
+            last_gae = delta + gamma * gae_lambda * (1.0 - dones[step]) * last_gae
+            advantages[step] = last_gae
+        # 核心
+        self.advantages = advantages
+        self.returns = advantages + values
+
+    def get(
+        self, batch_size: int, device: torch.device
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        """把 rollout 数据转成张量并按 mini-batch 随机产出;每次调用重新打乱。"""
+
+        if self.advantages is None:
+            raise RuntimeError("必须先调用 compute_returns_and_advantages() 再调用 get()")
+
+        states = torch.as_tensor(np.asarray(self.states), dtype=torch.float32, device=device)
+        actions = torch.as_tensor(self.actions, dtype=torch.long, device=device)
+        log_probs = torch.as_tensor(self.log_probs, dtype=torch.float32, device=device)
+        returns = torch.as_tensor(self.returns, dtype=torch.float32, device=device)
+        advantages = torch.as_tensor(self.advantages, dtype=torch.float32, device=device)
+
+        total = states.shape[0]
+
+        # 如果总数还不够一个batch,就直接返回全部数据。
+        batch_size = min(batch_size, total)
+        indices = np.random.permutation(total)
+
+        for start in range(0, total, batch_size):
+            idx = torch.as_tensor(indices[start : start + batch_size], device=device)
+            yield {
+                "states": states[idx],
+                "actions": actions[idx],
+                "old_log_probs": log_probs[idx],
+                "returns": returns[idx],
+                "advantages": advantages[idx],
+            }
+
+
 class PPO:
     """最小 PPO Agent,可复用于所有离散动作环境。"""
 
     def __init__(self, env: gym.Env, config: PPOConfig) -> None:
         """初始化 PPO。
 
-        按照Plan §7,自动从环境读取维度并创建网络:
-
             state_dim  = env.observation_space.shape[0]
             action_dim = env.action_space.n
-            actor      = Actor(state_dim, action_dim)
-            critic     = Critic(state_dim)
+            agent      = Agent(state_dim, action_dim)   # 内含 actor 与 critic
 
         同时创建:
         - 单个 Adam 优化器(eps=1e-5)统一管理两个网络的参数;
@@ -68,16 +224,16 @@ class PPO:
         self.config = config
         self.device = resolve_device(config.device)
 
-        # 自动从环境读取维度,创建 Actor / Critic / Optimizer / Buffer
+        # 自动从环境读取维度,创建 Agent(Actor + Critic)/ Optimizer / Buffer
         state_dim = int(env.observation_space.shape[0])
         action_dim = int(env.action_space.n)
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        self.actor = Actor(state_dim, action_dim, config.hidden_sizes).to(self.device)
-        self.critic = Critic(state_dim, config.hidden_sizes).to(self.device)
+        # 两个神经网络一起放进去
+        self.ac = Agent(state_dim, action_dim).to(self.device)
         self.optimizer = torch.optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()),
+            self.ac.parameters(),
             lr=config.learning_rate,
             eps=config.adam_eps,
         )
@@ -93,12 +249,9 @@ class PPO:
         self._episode_length = 0
         self._obs, _ = self.env.reset(seed=config.seed)
 
-    # ------------------------------------------------------------------
-    # 采样阶段
-    # ------------------------------------------------------------------
 
     def select_action(self, state, deterministic: bool = False):
-        """根据当前 Actor 对单个状态选择动作(Plan §8.1)。
+        """根据当前 Actor 对单个状态选择动作。
 
         流程:State → Actor → logits → Categorical 分布 → Action。
 
@@ -107,22 +260,24 @@ class PPO:
             log_prob   该动作的 log π(a|s),PPO ratio 的分母;
             value      Critic 的 V(s)。
 
-        deterministic=True 用于评估和测试(Plan §19:评估不采样)。
+        deterministic=True 用于评估和测试,不再sample。
         """
 
+        # unsqueeze加一维
         state_tensor = torch.as_tensor(
             state, dtype=torch.float32, device=self.device
         ).unsqueeze(0)
 
         with torch.no_grad():
-            logits = self.actor(state_tensor)
+            logits = self.ac.actor(state_tensor)
             dist = Categorical(logits=logits)
+            # 测试直接选概率最高的
             if deterministic:
                 action = torch.argmax(logits, dim=-1)
             else:
                 action = dist.sample()
             log_prob = dist.log_prob(action)
-            value = self.critic(state_tensor).squeeze(-1)
+            value = self.ac.critic(state_tensor).squeeze(-1)
         
         return int(action.item()), float(log_prob.item()), float(value.item())
 
@@ -131,11 +286,11 @@ class PPO:
 
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            value = self.critic(obs_tensor)
+            value = self.ac.critic(obs_tensor)
         return float(value.item())
 
     def collect_rollout(self) -> None:
-        """使用当前策略与环境交互,收集一批训练数据(Plan §8.2)。
+        """使用当前策略与环境交互,收集一批训练数据。
 
         rollout 结束后 self._obs 停在"当前观测"上:
         - 若回合还在进行中,它就是 GAE 末端 bootstrap 用的 s_T;
@@ -161,7 +316,6 @@ class PPO:
                 state=self._obs,
                 action=action,
                 reward=float(reward),
-                done=done,
                 log_prob=log_prob,
                 value=value,
                 terminated=terminated,
@@ -195,30 +349,8 @@ class PPO:
                 self._episode_return = 0.0
                 self._episode_length = 0
 
-    # ------------------------------------------------------------------
-    # 估计阶段
-    # ------------------------------------------------------------------
-
-    def compute_advantage(self) -> None:
-        """计算 Advantage 和 Return(Plan §10/§11)。
-
-        实际计算委托给 buffer.compute_returns_and_advantages(),
-        这里只负责提供 bootstrap 用的 last_value(当前观测的 V(s))。
-        """
-
-        last_value = self._state_value(self._obs)
-        self.buffer.compute_returns_and_advantages(
-            last_value=last_value,
-            gamma=self.config.gamma,
-            gae_lambda=self.config.gae_lambda,
-        )
-
-    # ------------------------------------------------------------------
-    # 更新阶段
-    # ------------------------------------------------------------------
-
     def update(self) -> dict[str, float]:
-        """执行若干个 epoch 的 PPO 更新,返回平均后的训练指标(Plan §12~§14)。
+        """执行若干个 epoch 的 PPO 更新,返回平均后的训练指标。
 
         对每个 mini-batch:
         1. 重新计算 log π_θ(a_t|s_t),ratio = exp(log_new - log_old);
@@ -230,7 +362,7 @@ class PPO:
                loss = policy_loss + value_coef·value_loss - entropy_coef·entropy
         5. 反向传播 → 梯度裁剪 → optimizer.step()。
 
-        返回指标(Plan §26):policy_loss / value_loss / entropy /
+        返回指标:policy_loss / value_loss / entropy /
         approx_kl(k3 估计)/ old_approx_kl / clip_fraction。
         """
 
@@ -255,11 +387,11 @@ class PPO:
                 returns = batch["returns"]  # Critic 的目标价值。
                 advantages = batch["advantages"]  # Actor 判断动作好坏的信号。
 
-                logits = self.actor(states)  # 新 Actor 对每个动作输出原始分数。
+                logits = self.ac.actor(states)  # 新 Actor 对每个动作输出原始分数。
                 dist = Categorical(logits=logits)  # 根据 logits 创建离散动作分布。
                 new_log_probs = dist.log_prob(actions)  # 新策略对旧动作的 log 概率。
                 entropy = dist.entropy().mean()  # 平均熵,鼓励 Actor 保持探索。
-                values = self.critic(states).squeeze(-1)  # Critic 对当前状态的价值预测。
+                values = self.ac.critic(states).squeeze(-1)  # Critic 对当前状态的价值预测。
 
                 # 比较新旧策略: ratio > 1 表示新策略更偏好该动作。
                 log_ratio = new_log_probs - old_log_probs
@@ -276,6 +408,7 @@ class PPO:
                     )  # 超出裁剪范围的样本比例。
 
                 # 每个 mini-batch 独立标准化 Advantage,避免数值尺度影响策略更新。
+                # 不懂... 为什么还要标准化advantage
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # PPO 策略损失:同时计算未裁剪和裁剪后的两种目标。
@@ -302,7 +435,7 @@ class PPO:
                 # PyTorch记录了整条计算路径，所以能从loss反推参数应该怎么调整。
                 
                 torch.nn.utils.clip_grad_norm_(
-                    list(self.actor.parameters()) + list(self.critic.parameters()),
+                    self.ac.parameters(),
                     self.config.max_grad_norm,
                 )  # 限制梯度大小,提高训练稳定性。
                 self.optimizer.step()  # 用 Adam 同时更新 Actor 和 Critic。
@@ -317,17 +450,13 @@ class PPO:
 
         return {name: value / max(update_count, 1) for name, value in stats.items()}
 
-    # ------------------------------------------------------------------
-    # 训练主循环
-    # ------------------------------------------------------------------
-
     def train(self) -> None:
-        """完整训练流程(Plan §15/§36):
+        """完整训练流程:
 
             collect_rollout → compute_advantage → update
                 → 记录 metrics → 周期评估 → best/latest 保存 → 循环
 
-        产物(按 Plan §20/§26/§27/§28):
+        产物:
             checkpoints/<env>/best.pth     评估 reward 最优的模型
             checkpoints/<env>/latest.pth   最新模型
             results/<env>/metrics.csv      每回合 return / length
@@ -335,6 +464,7 @@ class PPO:
             results/<env>/eval_metrics.csv     周期评估结果
             results/<env>/curves.png       训练曲线(原始 + 移动平均)
             results/<env>/eval_curve.png   评估曲线
+            results/<env>/diagnostics.png  训练诊断面板(KL/clip/熵/价值损失)
             results/<env>/config.json      本次运行的完整配置
         """
 
@@ -354,7 +484,12 @@ class PPO:
             self.iteration += 1
 
             self.collect_rollout()
-            self.compute_advantage()
+            last_value = self._state_value(self._obs)
+            self.buffer.compute_returns_and_advantages(
+                last_value=last_value,
+                gamma=self.config.gamma,
+                gae_lambda=self.config.gae_lambda,
+            )
             stats = self.update()
 
             update_records.append(
@@ -403,13 +538,14 @@ class PPO:
         save_json(result_dir / "config.json", asdict(self.config))
         plot_training_curve(self.episode_records, result_dir / "curves.png")
         plot_evaluation_curve(eval_records, result_dir / "eval_curve.png")
+        plot_diagnostics(update_records, result_dir / "diagnostics.png")
 
         print(f"训练完成: {self.global_step} 步,最优评估 reward={best_reward:.2f}")
         print(f"checkpoints: {checkpoint_dir.resolve()}")
         print(f"results:     {result_dir.resolve()}")
 
     # ------------------------------------------------------------------
-    # 模型保存与加载(Plan §20)
+    # 模型保存与加载
     # ------------------------------------------------------------------
 
     def save(self, path, include_optimizer: bool = False) -> None:
@@ -426,8 +562,8 @@ class PPO:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         payload = {
-            "actor": self.actor.state_dict(),
-            "critic": self.critic.state_dict(),
+            "actor": self.ac.actor.state_dict(),
+            "critic": self.ac.critic.state_dict(),
             "config": asdict(self.config),
             "global_step": self.global_step,
         }
@@ -445,12 +581,17 @@ class PPO:
         """
 
         checkpoint = torch.load(path, map_location="cpu")
-        config = PPOConfig(**checkpoint["config"])
+        # 只取 PPOConfig 认识的字段,兼容早期存档里的额外键。
+        known_fields = PPOConfig.__dataclass_fields__
+        config = PPOConfig(
+            **{k: v for k, v in checkpoint["config"].items() if k in known_fields}
+        )
         config.device = device
 
         agent = cls(env, config)
-        agent.actor.load_state_dict(checkpoint["actor"])
-        agent.critic.load_state_dict(checkpoint["critic"])
-        agent.actor.eval()
-        agent.critic.eval()
+        # 兼容旧存档:旧版 Actor/Critic 内部多一层 "net" 包装,键带 "net." 前缀。
+        strip = lambda sd: {k.removeprefix("net."): v for k, v in sd.items()}
+        agent.ac.actor.load_state_dict(strip(checkpoint["actor"]))
+        agent.ac.critic.load_state_dict(strip(checkpoint["critic"]))
+        agent.ac.eval()
         return agent

@@ -1,4 +1,4 @@
-"""项目通用的小工具(Plan §25)。
+"""项目通用的小工具。
 
 只放不属于 PPO 核心算法的通用功能:
     随机种子 / 设备解析 / checkpoint 保存加载 / metrics CSV / 曲线绘制。
@@ -19,7 +19,7 @@ import torch
 
 
 def set_seed(seed: int) -> None:
-    """固定 Python / NumPy / PyTorch(含 CUDA)的随机种子,保证实验可复现(Plan §31)。
+    """固定 Python / NumPy / PyTorch(含 CUDA)的随机种子,保证实验可复现。
 
     同时打开 cudnn 确定性模式(CleanRL 的 torch_deterministic 约定),
     代价是 GPU 训练可能略慢,课程实验规模下可以接受。
@@ -53,7 +53,7 @@ def env_dir_name(env_name: str) -> str:
 
 
 # ----------------------------------------------------------------------
-# checkpoint 保存与加载(Plan §20)
+# checkpoint 保存与加载
 # ----------------------------------------------------------------------
 
 
@@ -107,7 +107,7 @@ def load_checkpoint(
 
 
 # ----------------------------------------------------------------------
-# metrics 记录(Plan §26)
+# metrics 记录
 # ----------------------------------------------------------------------
 
 
@@ -148,7 +148,7 @@ def load_metrics(path: str) -> list[dict[str, Any]]:
 
 
 def moving_average(data: list[float], window: int) -> list[float]:
-    """计算滑动平均,用于训练曲线去噪(Plan §27:原始 reward + 移动平均)。"""
+    """计算滑动平均,用于训练曲线去噪(原始 reward + 移动平均)。"""
 
     if window <= 1 or len(data) < window:
         return list(data)
@@ -159,7 +159,7 @@ def moving_average(data: list[float], window: int) -> list[float]:
 
 
 # ----------------------------------------------------------------------
-# JSON 与绘图(Plan §27/§28)
+# JSON 与绘图
 # ----------------------------------------------------------------------
 
 
@@ -175,7 +175,7 @@ def save_json(path: str, data: Any) -> None:
 
 
 def plot_training_curve(metrics: list[dict[str, Any]], path: str) -> None:
-    """绘制 Reward vs Episode 训练曲线(Plan §27)。
+    """绘制 Reward vs Episode 训练曲线。
 
     同时绘制原始 reward 和移动平均 reward,横轴用全局步数,
     保存为 PNG。
@@ -210,11 +210,45 @@ def plot_training_curve(metrics: list[dict[str, Any]], path: str) -> None:
     plt.close()
 
 
-def plot_evaluation_curve(metrics: list[dict[str, Any]], path: str) -> None:
-    """绘制 Evaluation Reward vs Update 评估曲线(Plan §28)。
+def plot_diagnostics(metrics: list[dict[str, Any]], path: str) -> None:
+    """绘制 2×2 训练诊断面板:approx KL / clip_fraction / entropy / value_loss。
 
-    相比单个 episode reward,更适合观察策略性能;
-    同时画出 ±std 的包络,反映评估的波动。
+    结果曲线看"学得好不好",这张图看"训练过程健不健康":
+    KL 或 clip_fraction 持续偏高说明单次策略更新幅度过大;
+    entropy 断崖式下跌说明策略过早失去探索。
+    """
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not metrics:
+        return
+
+    steps = [item["step"] for item in metrics]
+    panels = [
+        ("approx_kl", "approx KL"),
+        ("clip_fraction", "clip fraction"),
+        ("entropy", "entropy"),
+        ("value_loss", "value loss"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+    for ax, (key, label) in zip(axes.flat, panels):
+        ax.plot(steps, [item[key] for item in metrics])
+        ax.set_title(label)
+        ax.set_xlabel("environment step")
+    fig.tight_layout()
+
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path_obj, dpi=150)
+    plt.close(fig)
+
+
+def plot_evaluation_curve(metrics: list[dict[str, Any]], path: str) -> None:
+    """绘制 Evaluation Reward vs Update 评估曲线。
     """
 
     import matplotlib

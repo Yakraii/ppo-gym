@@ -1,8 +1,8 @@
 {
   "env_name": "CartPole-v1",
-  "total_steps": 50000,
+  "total_steps": 100000,
   "seed": 42,
-  "device": "cuda",
+  "device": "auto",
   "rollout_steps": 2048,
   "update_epochs": 10,
   "batch_size": 64,
@@ -14,10 +14,6 @@
   "value_coef": 0.5,
   "entropy_coef": 0.01,
   "max_grad_norm": 0.5,
-  "hidden_sizes": [
-    64,
-    64
-  ],
   "eval_interval": 10,
   "eval_episodes": 5
 }

@@ -12,9 +12,7 @@
 ```text
 src/ppo_gym/
 ├── config.py      # PPOConfig,超参数集中管理
-├── networks.py    # Actor / Critic 独立 MLP(正交初始化)
-├── buffer.py      # RolloutBuffer + GAE(严格区分 terminated / truncated)
-├── ppo.py         # PPO 核心:采样、GAE、更新、训练、保存加载
+├── ppo.py         # Agent(Actor-Critic MLP)+ RolloutBuffer + PPO 核心:采样、GAE、更新、训练、保存加载
 ├── train.py       # 训练入口(命令行 ppo-gym)
 ├── evaluate.py    # 训练中周期评估
 ├── test.py        # 训练后最终测试
@@ -66,7 +64,9 @@ results/<env>/
 ├── eval_metrics.csv     # 周期评估结果
 ├── curves.png           # 训练曲线(原始 + 移动平均)
 ├── eval_curve.png       # 评估曲线(±1 std)
-└── test_report.json     # 最终测试报告(test.py 生成)
+├── diagnostics.png      # 诊断面板:KL / clip_fraction / entropy / value_loss
+├── test_curve.png       # 测试曲线:每回合确定性策略 return(test.py 生成)
+└── test_report.json     # 测试报告:mean/std/min/max + 逐回合 reward
 ```
 
 ## 参考

@@ -1,8 +1,8 @@
 """最小可复用 PPO 模板的测试。
 
 按照 Plan.md 的模块划分,优先覆盖最容易出错的部分:
-    1. 网络输出维度(networks);
-    2. GAE / Return 计算(buffer),含 terminated 与 truncated 的区分;
+    1. 网络输出维度(Agent);
+    2. GAE / Return 计算(RolloutBuffer),含 terminated 与 truncated 的区分;
     3. 配置对象(config)。
 
 运行:
@@ -16,21 +16,19 @@ import unittest
 import numpy as np
 import torch
 
-from ppo_gym.buffer import RolloutBuffer
 from ppo_gym.config import PPOConfig
-from ppo_gym.networks import Actor, Critic
+from ppo_gym.ppo import Agent, RolloutBuffer
 
 
 class TestNetworks(unittest.TestCase):
     def test_actor_critic_output_shapes(self) -> None:
         """验证 Actor / Critic 输出维度,避免环境维度变化后出现张量形状错误。"""
 
-        actor = Actor(state_dim=4, action_dim=2)
-        critic = Critic(state_dim=4)
+        agent = Agent(state_dim=4, action_dim=2)
         obs = torch.zeros(3, 4)
 
-        logits = actor(obs)
-        values = critic(obs)
+        logits = agent.actor(obs)
+        values = agent.critic(obs)
 
         self.assertEqual(tuple(logits.shape), (3, 2))
         self.assertEqual(tuple(values.shape), (3, 1))
@@ -38,8 +36,8 @@ class TestNetworks(unittest.TestCase):
     def test_actor_initial_logits_near_uniform(self) -> None:
         """正交初始化(std=0.01)后初始 logits 应接近全 0,即策略接近均匀。"""
 
-        actor = Actor(state_dim=8, action_dim=4)
-        logits = actor(torch.zeros(1, 8))
+        agent = Agent(state_dim=8, action_dim=4)
+        logits = agent.actor(torch.zeros(1, 8))
         self.assertTrue(torch.all(logits.abs() < 0.5))
 
 
@@ -65,7 +63,6 @@ class TestRolloutBuffer(unittest.TestCase):
                 state=np.array([0.0], dtype=np.float32),
                 action=0,
                 reward=reward,
-                done=terminated or truncated,
                 log_prob=0.0,
                 value=value,
                 terminated=terminated,
