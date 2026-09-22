@@ -53,7 +53,15 @@ uv run python -m ppo_gym.visualize --checkpoint checkpoints/cartpole/best.pth --
 uv run ppo-gym --env CartPole-v1 --lr 1e-3 --clip-epsilon 0.1
 ```
 
-## 结果
+## 结果展示
+
+### CartPole-v1
+
+![CartPole 训练诊断图：KL、clip fraction、entropy 与 value loss](results/cartpole/diagnostics.png)
+
+### LunarLander-v3
+
+[▶ LunarLander 测试视频](https://github.com/Yakraii/ppo-gym/blob/main/videos/lunarlander/rl-video-episode-1.mp4)
 
 每次运行的完整配置写入 `results/<env>/config.json`:
 
